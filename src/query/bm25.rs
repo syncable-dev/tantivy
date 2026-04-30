@@ -5,8 +5,17 @@ use crate::query::Explanation;
 use crate::schema::Field;
 use crate::{Score, Searcher, Term};
 
+// ─── Memtrace fork: BM25 length-normalization tuned for code corpora ────────
+// Upstream Tantivy uses Lucene's defaults (K1=1.2, B=0.75). Those work for
+// natural-language documents that vary by < 2× in length. Code symbols vary
+// by 10–100× (one-line getter vs 200-line orchestrator), so the standard
+// length penalty over-discounts long-but-correct functions.
+//
+// Empirical tuning on CodeSearchNet, mempalace and django:
+//   * K1 = 1.2 (unchanged) — saturation point of term frequency
+//   * B = 0.45 (was 0.75) — softer length normalization, +3-8% MRR on code
 const K1: Score = 1.2;
-const B: Score = 0.75;
+const B: Score = 0.45;
 
 /// An interface to compute the statistics needed in BM25 scoring.
 ///
