@@ -44,18 +44,44 @@ impl FileWatcher {
             .name("thread-tantivy-meta-file-watcher".to_string())
             .spawn(move || {
                 let mut current_checksum_opt = None;
+                // Telemetry #415: this thread polls meta.json at 2 Hz. When the
+                // file is absent (index root not yet committed) or briefly
+                // unreadable, the prior code warned on EVERY poll — a single
+                // watcher produced 6942 identical events in one hour. Track the
+                // last error condition and log only on its *rising edge*, so a
+                // persistently-missing meta file costs one log line, not 7200/hr.
+                let mut last_err_kind: Option<io::ErrorKind> = None;
 
                 while state.load(Ordering::SeqCst) == 1 {
-                    if let Ok(checksum) = FileWatcher::compute_checksum(&path) {
-                        let metafile_has_changed = current_checksum_opt
-                            .map(|current_checksum| current_checksum != checksum)
-                            .unwrap_or(true);
-                        if metafile_has_changed {
-                            info!("Meta file {:?} was modified", path);
-                            current_checksum_opt = Some(checksum);
-                            // We actually ignore callbacks failing here.
-                            // We just wait for the end of their execution.
-                            let _ = callbacks.broadcast().wait();
+                    match FileWatcher::compute_checksum(&path) {
+                        Ok(checksum) => {
+                            last_err_kind = None;
+                            let metafile_has_changed = current_checksum_opt
+                                .map(|current_checksum| current_checksum != checksum)
+                                .unwrap_or(true);
+                            if metafile_has_changed {
+                                info!("Meta file {:?} was modified", path);
+                                current_checksum_opt = Some(checksum);
+                                // We actually ignore callbacks failing here.
+                                // We just wait for the end of their execution.
+                                let _ = callbacks.broadcast().wait();
+                            }
+                        }
+                        Err(e) => {
+                            if last_err_kind != Some(e.kind()) {
+                                last_err_kind = Some(e.kind());
+                                match e.kind() {
+                                    // Expected while the index is initializing or
+                                    // the directory is access-restricted — not a
+                                    // defect, so keep it out of warn-level telemetry.
+                                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
+                                        debug!("Meta file {:?} not readable yet: {:?}", path, e);
+                                    }
+                                    _ => {
+                                        warn!("Failed to open meta file {:?}: {:?}", path, e);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -71,14 +97,11 @@ impl FileWatcher {
         handle
     }
 
+    // Pure read: callers own logging. The polling loop in `spawn` logs only
+    // on the rising edge of a new error condition (telemetry #415) — logging
+    // here would re-introduce the 2 Hz warn spam this function used to emit.
     fn compute_checksum(path: &Path) -> Result<u32, io::Error> {
-        let reader = match fs::File::open(path) {
-            Ok(f) => io::BufReader::new(f),
-            Err(e) => {
-                warn!("Failed to open meta file {:?}: {:?}", path, e);
-                return Err(e);
-            }
-        };
+        let reader = io::BufReader::new(fs::File::open(path)?);
 
         let mut hasher = Hasher::new();
 
